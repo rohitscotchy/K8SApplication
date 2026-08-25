@@ -129,11 +129,11 @@ jobs:
 
       - name: Prepare Kubernetes manifest
         run: |
-          sed -i "s|\${IMAGE_TAG}|${GITHUB_SHA}|g" k8s/deployment.yaml
-          sed -i "s|YOUR_DOCKERHUB_USERNAME|${{ secrets.DOCKERHUB_USERNAME }}|g" k8s/deployment.yaml
+          sed -i "s|\${IMAGE_TAG}|${GITHUB_SHA}|g" k8s/deployment.yml
+          sed -i "s|YOUR_DOCKERHUB_USERNAME|${{ secrets.DOCKERHUB_USERNAME }}|g" k8s/deployment.yml
 
           echo "Deployment manifest:"
-          cat k8s/deployment.yaml
+          cat k8s/deployment.yml
 
       - name: Deploy application
         run: |
