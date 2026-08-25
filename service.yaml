@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+
+metadata:
+  name: testwbapp
+
+spec:
+  type: ClusterIP
+
+  selector:
+    app: testwbapp
+
+  ports:
+    - protocol: TCP
+      port: 8000
+      targetPort: 8000
