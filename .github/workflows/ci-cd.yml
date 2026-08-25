@@ -1,4 +1,5 @@
-name: CI/CD Pipeline
+```yaml
+name: CI/CD Pipeline with vind
 
 on:
   push:
@@ -11,12 +12,14 @@ on:
       - main
       - develop
 
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/testwbapp
 
 jobs:
 
-  # ============================================================
-  # CI - Run tests against PostgreSQL
-  # ============================================================
   test:
     name: Run Tests
     runs-on: ubuntu-latest
@@ -24,58 +27,38 @@ jobs:
     services:
       postgres:
         image: postgres:15-alpine
-
         env:
           POSTGRES_USER: testuser
           POSTGRES_PASSWORD: testpassword
           POSTGRES_DB: testdb
-
         options: >-
           --health-cmd "pg_isready -U testuser -d testdb"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
-
         ports:
           - 5432:5432
 
     steps:
-
-      # --------------------------------------------------------
-      # Checkout source code
-      # --------------------------------------------------------
       - name: Checkout code
         uses: actions/checkout@v4
 
-
-      # --------------------------------------------------------
-      # Setup Python
-      # --------------------------------------------------------
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
+          cache: pip
           cache-dependency-path: requirement.txt
 
-
-      # --------------------------------------------------------
-      # Install dependencies
-      # --------------------------------------------------------
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirement.txt
           python -m pip install pytest-cov
 
-
-      # --------------------------------------------------------
-      # Run tests + coverage
-      # --------------------------------------------------------
       - name: Run tests with coverage
         env:
           DATABASE_URL: postgresql+psycopg://testuser:testpassword@localhost:5432/testdb
-
         run: |
           python -m pytest test/ \
             -v \
@@ -84,10 +67,6 @@ jobs:
             --cov-report=term \
             --cov-report=xml
 
-
-      # --------------------------------------------------------
-      # Upload coverage report
-      # --------------------------------------------------------
       - name: Upload coverage report
         if: always()
         uses: actions/upload-artifact@v4
@@ -95,267 +74,116 @@ jobs:
           name: coverage-report
           path: coverage.xml
 
-
-  # ============================================================
-  # CD - Build Docker Image
-  # ============================================================
-  build:
-    name: Build Docker Image
+  build_push:
+    name: Build and Push Docker Image
     needs: test
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
 
-    # Build only for push events
-    if: github.event_name == 'push'
-
     steps:
-
-      # --------------------------------------------------------
-      # Checkout source code
-      # --------------------------------------------------------
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # --------------------------------------------------------
-      # Build Docker image
-      # --------------------------------------------------------
       - name: Build Docker image
         run: |
           docker build \
-            -t testwbapp:${{ github.sha }} \
+            -t "${IMAGE_NAME}:${GITHUB_SHA}" \
+            -t "${IMAGE_NAME}:latest" \
             .
 
-
-      # --------------------------------------------------------
-      # Verify Docker image
-      # --------------------------------------------------------
       - name: Verify Docker image
         run: |
           docker image ls
-          docker inspect testwbapp:${{ github.sha }}
+          docker inspect "${IMAGE_NAME}:${GITHUB_SHA}"
 
-
-  # ============================================================
-  # CD - Deploy Application to QA
-  # ============================================================
-  deploy_qa:
-    name: Deploy to QA
-    needs: build
-    runs-on: ubuntu-latest
-
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-
-    steps:
-
-      # --------------------------------------------------------
-      # Trigger QA Render deployment
-      # --------------------------------------------------------
-      - name: Deploy to Render QA
-        env:
-          RENDER_QA_DEPLOY_HOOK: ${{ secrets.RENDER_QA_DEPLOY_HOOK }}
-
+      - name: Push Docker image
         run: |
-          if [ -z "$RENDER_QA_DEPLOY_HOOK" ]; then
-            echo "RENDER_QA_DEPLOY_HOOK is not configured."
-            exit 1
-          fi
+          docker push "${IMAGE_NAME}:${GITHUB_SHA}"
+          docker push "${IMAGE_NAME}:latest"
 
-          curl --fail --show-error --silent \
-            --request POST \
-            "$RENDER_QA_DEPLOY_HOOK"
-
-          echo "QA deployment triggered."
-
-
-      # --------------------------------------------------------
-      # Wait for QA application
-      # --------------------------------------------------------
-      - name: Wait for QA application
-        run: |
-
-          QA_URL="https://testwebapp-qa.onrender.com/Channel/channels"
-
-          echo "Waiting for QA application..."
-          echo "Health check URL: $QA_URL"
-
-          for i in {1..30}; do
-
-            echo "Attempt $i/30"
-
-            HTTP_STATUS=$(curl \
-              --silent \
-              --output /dev/null \
-              --write-out "%{http_code}" \
-              --max-time 15 \
-              "$QA_URL" || true)
-
-            echo "HTTP Status: $HTTP_STATUS"
-
-            if [ "$HTTP_STATUS" = "200" ]; then
-              echo "QA application is available."
-              exit 0
-            fi
-
-            sleep 10
-
-          done
-
-          echo "QA application did not become available."
-          exit 1
-
-
-  # ============================================================
-  # QA - Trigger Automation Repository
-  # ============================================================
-  qa_regression:
-    name: Run QA Regression
-    needs: deploy_qa
+  deploy_vind:
+    name: Deploy to vind Kubernetes
+    needs: build_push
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      # --------------------------------------------------------
-      # Trigger TestWebApp-Automation workflow
-      # --------------------------------------------------------
-      - name: Trigger QA Automation
-        env:
-          QA_AUTOMATION_TOKEN: ${{ secrets.QA_AUTOMATION_TOKEN }}
+      - name: Create vind Kubernetes cluster
+        uses: loft-sh/setup-vind@v1
+        with:
+          name: testwbapp-cicd
 
+      - name: Verify Kubernetes cluster
         run: |
+          kubectl get nodes -o wide
+          kubectl get namespaces
+          kubectl get pods -A
 
-          if [ -z "$QA_AUTOMATION_TOKEN" ]; then
-            echo "QA_AUTOMATION_TOKEN is not configured."
-            exit 1
-          fi
-
-          curl --fail --show-error --silent \
-            --request POST \
-            --url "https://api.github.com/repos/rohitscotchy/TestWebAppAutomation/actions/workflows/qa-regression.yml/dispatches" \
-            --header "Accept: application/vnd.github+json" \
-            --header "Authorization: Bearer $QA_AUTOMATION_TOKEN" \
-            --header "X-GitHub-Api-Version: 2022-11-28" \
-            --data '{"ref":"main"}'
-
-          echo "QA automation workflow triggered."
-
-
-      # --------------------------------------------------------
-      # Wait for QA automation workflow
-      # --------------------------------------------------------
-      - name: Wait for QA regression
-        env:
-          GH_TOKEN: ${{ secrets.QA_AUTOMATION_TOKEN }}
-
+      - name: Prepare Kubernetes manifest
         run: |
+          sed -i "s|\${IMAGE_TAG}|${GITHUB_SHA}|g" k8s/deployment.yaml
+          sed -i "s|YOUR_DOCKERHUB_USERNAME|${{ secrets.DOCKERHUB_USERNAME }}|g" k8s/deployment.yaml
 
-          echo "Waiting for QA regression workflow..."
+          echo "Deployment manifest:"
+          cat k8s/deployment.yaml
 
-          # Give GitHub a few seconds to register the workflow run
-          sleep 5
-
-          for i in {1..60}; do
-
-            echo "Checking QA regression status... attempt $i/60"
-
-            RUN_INFO=$(gh run list \
-              --repo rohitscotchy/TestWebAppAutomation \
-              --workflow qa-regression.yml \
-              --branch main \
-              --limit 1 \
-              --json databaseId,status,conclusion,createdAt \
-              --jq '.[0]')
-
-            echo "$RUN_INFO"
-
-            if [ -z "$RUN_INFO" ]; then
-              echo "QA regression workflow has not appeared yet."
-              sleep 10
-              continue
-            fi
-
-            STATUS=$(echo "$RUN_INFO" | jq -r '.status')
-            CONCLUSION=$(echo "$RUN_INFO" | jq -r '.conclusion')
-
-            echo "Status: $STATUS"
-            echo "Conclusion: $CONCLUSION"
-
-            if [ "$STATUS" = "completed" ]; then
-
-              echo "QA regression completed."
-
-              if [ "$CONCLUSION" = "success" ]; then
-                echo "======================================"
-                echo "       QA REGRESSION PASSED"
-                echo "======================================"
-                exit 0
-              fi
-
-              echo "======================================"
-              echo "       QA REGRESSION FAILED"
-              echo "======================================"
-              exit 1
-            fi
-
-            sleep 10
-
-          done
-
-          echo "Timeout waiting for QA regression."
-          exit 1
-
-
-  # ============================================================
-  # CD - Deploy Production
-  # ============================================================
-  deploy_production:
-    name: Deploy to Production
-    needs: qa_regression
-    runs-on: ubuntu-latest
-
-    # Production deployment ONLY happens from main
-    # AND only if QA regression succeeds.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-
-    steps:
-
-      # --------------------------------------------------------
-      # Deploy to production
-      # --------------------------------------------------------
-      - name: Deploy to Render Production
-        env:
-          RENDER_PROD_DEPLOY_HOOK: ${{ secrets.RENDER_PROD_DEPLOY_HOOK }}
-
+      - name: Deploy application
         run: |
+          kubectl apply -f k8s/
 
-          if [ -z "$RENDER_PROD_DEPLOY_HOOK" ]; then
-            echo "RENDER_PROD_DEPLOY_HOOK is not configured."
-            exit 1
-          fi
-
-          curl --fail --show-error --silent \
-            --request POST \
-            "$RENDER_PROD_DEPLOY_HOOK"
-
-          echo "Production deployment triggered successfully."
-
-
-      # --------------------------------------------------------
-      # Deployment successful
-      # --------------------------------------------------------
-      - name: Deployment successful
-        if: success()
+      - name: Wait for Kubernetes deployment
         run: |
-          echo "=========================================="
-          echo " Production deployment successful"
-          echo "=========================================="
+          kubectl rollout status \
+            deployment/testwbapp \
+            --timeout=180s
 
+      - name: Verify Kubernetes resources
+        run: |
+          echo "=== Nodes ==="
+          kubectl get nodes -o wide
 
-      # --------------------------------------------------------
-      # Deployment failed
-      # --------------------------------------------------------
-      - name: Deployment failed
+          echo "=== Pods ==="
+          kubectl get pods -o wide
+
+          echo "=== Deployment ==="
+          kubectl get deployment testwbapp
+
+          echo "=== Services ==="
+          kubectl get services
+
+      - name: Show deployment details on failure
         if: failure()
         run: |
+          kubectl get pods -o wide
+          kubectl describe pods
+          kubectl logs deployment/testwbapp --all-containers=true || true
+          kubectl get events --sort-by=.lastTimestamp
+
+      - name: Run Kubernetes smoke test
+        run: |
+          kubectl run smoke-test \
+            --image=curlimages/curl:latest \
+            --restart=Never \
+            --rm \
+            -i \
+            --timeout=120s \
+            -- \
+            curl -f http://testwbapp:8000/health
+
+      - name: Kubernetes deployment successful
+        run: |
           echo "=========================================="
-          echo " Production deployment failed"
+          echo " vind Kubernetes deployment successful"
           echo "=========================================="
+```
+
+::: 
