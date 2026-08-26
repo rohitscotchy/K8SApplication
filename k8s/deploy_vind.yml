@@ -1,114 +1,57 @@
-  deploy_vind:
-    name: Deploy to vind Kubernetes
-    needs: build_push
-    if: github.event_name == 'push'
-    runs-on: ubuntu-latest
+apiVersion: apps/v1
+kind: Deployment
 
-    steps:
+metadata:
+  name: testwbapp
 
-      - name: Checkout code
-        uses: actions/checkout@v4
+spec:
+  replicas: 2
 
-      - name: Create vind Kubernetes cluster
-        uses: loft-sh/setup-vind@v1
-        with:
-          name: testwbapp-cicd
+  selector:
+    matchLabels:
+      app: testwbapp
 
-      - name: Verify vind Kubernetes cluster
-        run: |
-          echo "=== Kubernetes version ==="
-          kubectl version --client
+  template:
+    metadata:
+      labels:
+        app: testwbapp
 
-          echo "=== Kubernetes nodes ==="
-          kubectl get nodes -o wide
+    spec:
+      imagePullSecrets:
+        - name: dockerhub-secret
 
-          echo "=== Kubernetes namespaces ==="
-          kubectl get namespaces
+      containers:
+        - name: testwbapp
+          image: YOUR_DOCKERHUB_USERNAME/testwbapp:${IMAGE_TAG}
+          imagePullPolicy: Always
 
-      - name: Create Docker Hub image pull secret
-        run: |
-          kubectl create secret docker-registry dockerhub-secret \
-            --docker-server=https://index.docker.io/v1/ \
-            --docker-username="${{ secrets.DOCKERHUB_USERNAME }}" \
-            --docker-password="${{ secrets.DOCKERHUB_TOKEN }}"
+          ports:
+            - containerPort: 8000
 
-      - name: Prepare Kubernetes manifest
-        run: |
-          echo "=== Original manifest ==="
-          cat k8s/deploy_vind.yml
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
 
-          sed -i \
-            "s|\${IMAGE_TAG}|${GITHUB_SHA}|g" \
-            k8s/deploy_vind.yml
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
 
-          sed -i \
-            "s|YOUR_DOCKERHUB_USERNAME|${{ secrets.DOCKERHUB_USERNAME }}|g" \
-            k8s/deploy_vind.yml
 
-          echo "=== Final manifest ==="
-          cat k8s/deploy_vind.yml
 
-      - name: Validate Kubernetes manifest
-        run: |
-          kubectl apply \
-            --dry-run=client \
-            -f k8s/deploy_vind.yml
+apiVersion: v1
+kind: Service
 
-      - name: Deploy application to vind
-        run: |
-          kubectl apply \
-            -f k8s/deploy_vind.yml
+metadata:
+  name: testwbapp
 
-      - name: Wait for deployment
-        run: |
-          kubectl rollout status \
-            deployment/testwbapp \
-            --timeout=180s
+spec:
+  selector:
+    app: testwbapp
 
-      - name: Verify deployment
-        run: |
-          echo "=== Deployment ==="
-          kubectl get deployment testwbapp
+  type: ClusterIP
 
-          echo "=== Pods ==="
-          kubectl get pods -o wide
-
-          echo "=== Services ==="
-          kubectl get services
-
-      - name: Debug deployment on failure
-        if: failure()
-        run: |
-          echo "=== Pods ==="
-          kubectl get pods -o wide || true
-
-          echo "=== Deployment ==="
-          kubectl describe deployment testwbapp || true
-
-          echo "=== Pod details ==="
-          kubectl describe pods || true
-
-          echo "=== Pod logs ==="
-          kubectl logs deployment/testwbapp \
-            --all-containers=true || true
-
-          echo "=== Kubernetes events ==="
-          kubectl get events \
-            --sort-by=.lastTimestamp || true
-
-      - name: Run Kubernetes smoke test
-        run: |
-          kubectl run smoke-test \
-            --image=curlimages/curl:latest \
-            --restart=Never \
-            --rm \
-            -i \
-            --timeout=120s \
-            -- \
-            curl -f http://testwbapp:8000/Channel/channels
-
-      - name: Deployment successful
-        run: |
-          echo "=========================================="
-          echo " vind Kubernetes deployment successful"
-          echo "=========================================="
+  ports:
+    - protocol: TCP
+      port: 8000
+      targetPort: 8000
