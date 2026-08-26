@@ -1,0 +1,112 @@
+  deploy_vind:
+    name: Deploy to vind Kubernetes
+    needs: build_push
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Create vind Kubernetes cluster
+        uses: loft-sh/setup-vind@v1
+        with:
+          name: testwbapp-cicd
+
+      - name: Verify Kubernetes cluster
+        run: |
+          echo "=== Kubernetes Nodes ==="
+          kubectl get nodes -o wide
+
+          echo "=== Namespaces ==="
+          kubectl get namespaces
+
+          echo "=== All Pods ==="
+          kubectl get pods -A
+
+      - name: Create Docker Hub image pull secret
+        run: |
+          kubectl create secret docker-registry dockerhub-secret \
+            --docker-server=https://index.docker.io/v1/ \
+            --docker-username="${{ secrets.DOCKERHUB_USERNAME }}" \
+            --docker-password="${{ secrets.DOCKERHUB_TOKEN }}"
+
+      - name: Prepare Kubernetes manifest
+        run: |
+          echo "=== Kubernetes files ==="
+          find k8s -maxdepth 2 -type f -print
+
+          echo "=== Preparing deployment manifest ==="
+
+          sed -i \
+            "s|\${IMAGE_TAG}|${GITHUB_SHA}|g" \
+            k8s/deploy_vind.yml
+
+          sed -i \
+            "s|YOUR_DOCKERHUB_USERNAME|${{ secrets.DOCKERHUB_USERNAME }}|g" \
+            k8s/deploy_vind.yml
+
+          echo "=== Deployment manifest ==="
+          cat k8s/deploy_vind.yml
+
+      - name: Deploy application
+        run: |
+          kubectl apply -f k8s/deploy_vind.yml
+
+      - name: Wait for Kubernetes deployment
+        run: |
+          kubectl rollout status \
+            deployment/testwbapp \
+            --timeout=180s
+
+      - name: Verify Kubernetes resources
+        run: |
+          echo "=== Nodes ==="
+          kubectl get nodes -o wide
+
+          echo "=== Deployments ==="
+          kubectl get deployments
+
+          echo "=== Pods ==="
+          kubectl get pods -o wide
+
+          echo "=== Services ==="
+          kubectl get services
+
+      - name: Show deployment details on failure
+        if: failure()
+        run: |
+          echo "=== Pods ==="
+          kubectl get pods -o wide
+
+          echo "=== Deployment ==="
+          kubectl describe deployment testwbapp || true
+
+          echo "=== Pods description ==="
+          kubectl describe pods || true
+
+          echo "=== Pod logs ==="
+          kubectl logs deployment/testwbapp \
+            --all-containers=true || true
+
+          echo "=== Kubernetes events ==="
+          kubectl get events \
+            --sort-by=.lastTimestamp
+
+      - name: Run Kubernetes smoke test
+        run: |
+          kubectl run smoke-test \
+            --image=curlimages/curl:latest \
+            --restart=Never \
+            --rm \
+            -i \
+            --timeout=120s \
+            -- \
+            curl -f http://testwbapp:8000/health
+
+      - name: Kubernetes deployment successful
+        run: |
+          echo "=========================================="
+          echo "vind Kubernetes deployment successful"
+          echo "=========================================="

@@ -19,6 +19,9 @@ env:
 
 jobs:
 
+  # ============================================================
+  # CI - Run application tests
+  # ============================================================
   test:
     name: Run Tests
     runs-on: ubuntu-latest
@@ -26,22 +29,32 @@ jobs:
     services:
       postgres:
         image: postgres:15-alpine
+
         env:
           POSTGRES_USER: testuser
           POSTGRES_PASSWORD: testpassword
           POSTGRES_DB: testdb
+
         options: >-
           --health-cmd "pg_isready -U testuser -d testdb"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+
         ports:
           - 5432:5432
 
     steps:
+
+      # --------------------------------------------------------
+      # Checkout source code
+      # --------------------------------------------------------
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # --------------------------------------------------------
+      # Setup Python
+      # --------------------------------------------------------
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -49,15 +62,22 @@ jobs:
           cache: pip
           cache-dependency-path: requirement.txt
 
+      # --------------------------------------------------------
+      # Install dependencies
+      # --------------------------------------------------------
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirement.txt
           python -m pip install pytest-cov
 
+      # --------------------------------------------------------
+      # Run tests + coverage
+      # --------------------------------------------------------
       - name: Run tests with coverage
         env:
           DATABASE_URL: postgresql+psycopg://testuser:testpassword@localhost:5432/testdb
+
         run: |
           python -m pytest test/ \
             -v \
@@ -66,109 +86,400 @@ jobs:
             --cov-report=term \
             --cov-report=xml
 
+      # --------------------------------------------------------
+      # Upload coverage
+      # --------------------------------------------------------
       - name: Upload coverage report
         if: always()
         uses: actions/upload-artifact@v4
-        with:
-          name: coverage-report
-          path: coverage.xml
 
+        with:
+          name: coverage-report-${{ github.run_id }}
+          path: coverage.xml
+          if-no-files-found: warn
+
+
+  # ============================================================
+  # CD - Build and Push Docker Image
+  #
+  # Runs only after tests pass.
+  # Runs only for push events.
+  # ============================================================
   build_push:
     name: Build and Push Docker Image
+
     needs: test
+
     if: github.event_name == 'push'
+
     runs-on: ubuntu-latest
 
     steps:
+
+      # --------------------------------------------------------
+      # Checkout source
+      # --------------------------------------------------------
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # --------------------------------------------------------
+      # Validate Docker Hub credentials
+      # --------------------------------------------------------
+      - name: Validate Docker Hub secrets
+        run: |
+
+          if [ -z "${{ secrets.DOCKERHUB_USERNAME }}" ]; then
+            echo "ERROR: DOCKERHUB_USERNAME is not configured."
+            exit 1
+          fi
+
+          if [ -z "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
+            echo "ERROR: DOCKERHUB_TOKEN is not configured."
+            exit 1
+          fi
+
+      # --------------------------------------------------------
+      # Login to Docker Hub
+      # --------------------------------------------------------
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
+
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      # --------------------------------------------------------
+      # Build Docker image
+      # --------------------------------------------------------
       - name: Build Docker image
         run: |
+
+          echo "Building image:"
+          echo "${IMAGE_NAME}:${GITHUB_SHA}"
+
           docker build \
             -t "${IMAGE_NAME}:${GITHUB_SHA}" \
             -t "${IMAGE_NAME}:latest" \
             .
 
+      # --------------------------------------------------------
+      # Verify Docker image
+      # --------------------------------------------------------
       - name: Verify Docker image
         run: |
+
+          echo "=== Docker Images ==="
+
           docker image ls
+
+          echo "=== Docker Image Details ==="
+
           docker inspect "${IMAGE_NAME}:${GITHUB_SHA}"
 
+      # --------------------------------------------------------
+      # Push Docker image
+      # --------------------------------------------------------
       - name: Push Docker image
         run: |
+
           docker push "${IMAGE_NAME}:${GITHUB_SHA}"
+
           docker push "${IMAGE_NAME}:latest"
 
+          echo "Docker image pushed successfully."
+
+
+  # ============================================================
+  # CD - Deploy to vind Kubernetes
+  #
+  # This creates a temporary Kubernetes cluster inside the
+  # GitHub Actions runner.
+  # ============================================================
   deploy_vind:
     name: Deploy to vind Kubernetes
+
     needs: build_push
+
     if: github.event_name == 'push'
+
     runs-on: ubuntu-latest
 
     steps:
+
+      # --------------------------------------------------------
+      # Checkout source
+      # --------------------------------------------------------
       - name: Checkout code
         uses: actions/checkout@v4
 
+
+      # --------------------------------------------------------
+      # Create vind Kubernetes cluster
+      # --------------------------------------------------------
       - name: Create vind Kubernetes cluster
         uses: loft-sh/setup-vind@v1
+
         with:
           name: testwbapp-cicd
 
+
+      # --------------------------------------------------------
+      # Verify Kubernetes cluster
+      # --------------------------------------------------------
       - name: Verify Kubernetes cluster
         run: |
-          kubectl get nodes -o wide
-          kubectl get namespaces
-          kubectl get pods -A
 
+          echo "======================================"
+          echo "KUBERNETES CLIENT"
+          echo "======================================"
+
+          kubectl version --client
+
+          echo "======================================"
+          echo "KUBERNETES NODES"
+          echo "======================================"
+
+          kubectl get nodes -o wide
+
+          echo "======================================"
+          echo "KUBERNETES NAMESPACES"
+          echo "======================================"
+
+          kubectl get namespaces
+
+
+      # --------------------------------------------------------
+      # Validate Docker Hub credentials
+      # --------------------------------------------------------
+      - name: Validate Docker Hub secrets
+        run: |
+
+          if [ -z "${{ secrets.DOCKERHUB_USERNAME }}" ]; then
+            echo "ERROR: DOCKERHUB_USERNAME is not configured."
+            exit 1
+          fi
+
+          if [ -z "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
+            echo "ERROR: DOCKERHUB_TOKEN is not configured."
+            exit 1
+          fi
+
+
+      # --------------------------------------------------------
+      # Create Docker Hub image pull secret
+      #
+      # Required because the Docker Hub repository is private.
+      # --------------------------------------------------------
+      - name: Create Docker Hub image pull secret
+        run: |
+
+          kubectl create secret docker-registry dockerhub-secret \
+            --docker-server=https://index.docker.io/v1/ \
+            --docker-username="${{ secrets.DOCKERHUB_USERNAME }}" \
+            --docker-password="${{ secrets.DOCKERHUB_TOKEN }}"
+
+          echo "Docker Hub Kubernetes secret created."
+
+
+      # --------------------------------------------------------
+      # Validate Kubernetes manifest
+      #
+      # Expected repository structure:
+      #
+      # k8s/
+      # └── deploy_vind.yml
+      # --------------------------------------------------------
+      - name: Validate Kubernetes manifest
+        run: |
+
+          echo "======================================"
+          echo "CHECK KUBERNETES DIRECTORY"
+          echo "======================================"
+
+          if [ ! -d "k8s" ]; then
+
+            echo "ERROR: k8s directory does not exist."
+
+            echo "Repository structure:"
+            find . -maxdepth 3 -type f | sort
+
+            exit 1
+
+          fi
+
+
+          echo "======================================"
+          echo "KUBERNETES FILES"
+          echo "======================================"
+
+          find k8s -maxdepth 2 -type f -print
+
+
+          if [ ! -f "k8s/deploy_vind.yml" ]; then
+
+            echo "ERROR: k8s/deploy_vind.yml does not exist."
+
+            echo "Expected:"
+            echo "k8s/deploy_vind.yml"
+
+            exit 1
+
+          fi
+
+
+          echo "Kubernetes manifest found successfully."
+
+
+      # --------------------------------------------------------
+      # Prepare Kubernetes manifest
+      #
+      # Replace:
+      #
+      # YOUR_DOCKERHUB_USERNAME
+      #
+      # and:
+      #
+      # ${IMAGE_TAG}
+      #
+      # with real values.
+      # --------------------------------------------------------
       - name: Prepare Kubernetes manifest
         run: |
-          sed -i "s|\${IMAGE_TAG}|${GITHUB_SHA}|g" k8s/deployment.yml
-          sed -i "s|YOUR_DOCKERHUB_USERNAME|${{ secrets.DOCKERHUB_USERNAME }}|g" k8s/deployment.yml
 
-          echo "Deployment manifest:"
-          cat k8s/deployment.yml
+          echo "Preparing Kubernetes deployment..."
 
+          sed -i \
+            "s|\${IMAGE_TAG}|${GITHUB_SHA}|g" \
+            k8s/deploy_vind.yml
+
+
+          sed -i \
+            "s|YOUR_DOCKERHUB_USERNAME|${{ secrets.DOCKERHUB_USERNAME }}|g" \
+            k8s/deploy_vind.yml
+
+
+          echo "======================================"
+          echo "FINAL KUBERNETES MANIFEST"
+          echo "======================================"
+
+          cat k8s/deploy_vind.yml
+
+
+      # --------------------------------------------------------
+      # Deploy application
+      # --------------------------------------------------------
       - name: Deploy application
         run: |
-          kubectl apply -f k8s/
 
+          echo "Deploying application to Kubernetes..."
+
+          kubectl apply \
+            -f k8s/deploy_vind.yml
+
+
+      # --------------------------------------------------------
+      # Wait for deployment
+      # --------------------------------------------------------
       - name: Wait for Kubernetes deployment
         run: |
+
+          echo "Waiting for deployment..."
+
           kubectl rollout status \
             deployment/testwbapp \
             --timeout=180s
 
+
+      # --------------------------------------------------------
+      # Verify Kubernetes resources
+      # --------------------------------------------------------
       - name: Verify Kubernetes resources
         run: |
-          echo "=== Nodes ==="
+
+          echo "======================================"
+          echo "NODES"
+          echo "======================================"
+
           kubectl get nodes -o wide
 
-          echo "=== Pods ==="
+
+          echo "======================================"
+          echo "DEPLOYMENTS"
+          echo "======================================"
+
+          kubectl get deployments
+
+
+          echo "======================================"
+          echo "PODS"
+          echo "======================================"
+
           kubectl get pods -o wide
 
-          echo "=== Deployment ==="
-          kubectl get deployment testwbapp
 
-          echo "=== Services ==="
+          echo "======================================"
+          echo "SERVICES"
+          echo "======================================"
+
           kubectl get services
 
+
+      # --------------------------------------------------------
+      # Debug deployment if something fails
+      # --------------------------------------------------------
       - name: Show deployment details on failure
         if: failure()
         run: |
-          kubectl get pods -o wide
-          kubectl describe pods
-          kubectl logs deployment/testwbapp --all-containers=true || true
-          kubectl get events --sort-by=.lastTimestamp
 
+          echo "======================================"
+          echo "PODS"
+          echo "======================================"
+
+          kubectl get pods -o wide || true
+
+
+          echo "======================================"
+          echo "DEPLOYMENT"
+          echo "======================================"
+
+          kubectl describe deployment testwbapp || true
+
+
+          echo "======================================"
+          echo "POD DESCRIPTION"
+          echo "======================================"
+
+          kubectl describe pods || true
+
+
+          echo "======================================"
+          echo "POD LOGS"
+          echo "======================================"
+
+          kubectl logs deployment/testwbapp \
+            --all-containers=true || true
+
+
+          echo "======================================"
+          echo "KUBERNETES EVENTS"
+          echo "======================================"
+
+          kubectl get events \
+            --sort-by=.lastTimestamp || true
+
+
+      # --------------------------------------------------------
+      # Kubernetes smoke test
+      #
+      # Based on your existing application endpoint:
+      #
+      # /Channel/channels
+      # --------------------------------------------------------
       - name: Run Kubernetes smoke test
         run: |
+
+          echo "Running Kubernetes smoke test..."
+
           kubectl run smoke-test \
             --image=curlimages/curl:latest \
             --restart=Never \
@@ -176,10 +487,16 @@ jobs:
             -i \
             --timeout=120s \
             -- \
-            curl -f http://testwbapp:8000/health
+            curl -f http://testwbapp:8000/Channel/channels
 
+
+      # --------------------------------------------------------
+      # Final success
+      # --------------------------------------------------------
       - name: Kubernetes deployment successful
         run: |
+
           echo "=========================================="
-          echo " vind Kubernetes deployment successful"
+          echo " Kubernetes deployment successful"
+          echo " vind Kubernetes deployment PASSED"
           echo "=========================================="
